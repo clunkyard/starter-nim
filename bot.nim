@@ -42,6 +42,7 @@
 # axis; pitch is positive up.
 # Manual: https://clunkyard.com/manual#sdk
 import clunkyard
+import std/math
 
 template get(query:untyped;robot:pointer):float64=
   block:
@@ -59,6 +60,15 @@ proc scan(robot:pointer;heading,arc,pitch:float64)=
   check(robot,cyScannerHeading(robot,heading));check(robot,cyScannerArc(robot,arc));check(robot,cyScannerPitch(robot,pitch))
 proc show(robot:pointer;text:string)=check(robot,cyStatusText(robot,text.cstring,text.len.cuint))
 proc show(robot:pointer;text:string;value:float64)=show(robot,text);check(robot,cyStatusValue(robot,value))
+# The arena's calibration kernel, xorshift-sqrt v1; safe to delete.
+proc calibrationWork(work,tick:uint64):float64=
+  var x=88172645463325252'u64 xor tick
+  var sum=0.0
+  var i=0'u64
+  while i<work:
+    x=x xor (x shl 13);x=x xor (x shr 7);x=x xor (x shl 17)
+    sum+=sqrt(float64(x shr 11));inc i
+  float64((uint64(floor(sum))+(x shr 40)) mod 1000000)
 var freeFlight=false
 proc start(robot:pointer)=
   var gravity:CyVec3
@@ -117,4 +127,8 @@ proc turn(robot:pointer)=
     if zone.shape==CY_SHAPE_SPHERE:check(robot,cyAnglesElevationTo(addr position,addr zone.center,addr climb))
     check(robot,cyAnglesAngleDiff(bearing,heading,addr delta));check(robot,cyAnglesClamp(delta/30,-1,1,addr turning))
     check(robot,cyAnglesClamp((climb-pitch)/30,-1,1,addr pitching));drive(robot,0.8,turning,pitching)
+  # Only the arena's rate calibration sends this; safe to delete.
+  var work:cdouble
+  const path="state.calibration.work"
+  if cyRawNumber(robot,path,path.len.cuint,addr work)==CY_OK and work>=1:show(robot,"WORK",calibrationWork(work.uint64,tick.uint64))
 run(turn,start)
