@@ -1,5 +1,7 @@
 # A robot on the Clunkyard core's Nim binding. The core owns tracking,
 # geometry and protocol handling; these callbacks choose the tactics.
+# It searches with a broad scan, narrows the beam on a contact, and leads
+# shots from a line through its recent sightings.
 # Clunkyard robot API 2.0.0: one core under every language, the same
 # answers everywhere. Facts (a call shows its arguments):
 # match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -43,7 +45,18 @@
 # your language cases them its own way. Angles are degrees from the +x
 # axis; pitch is positive up.
 # Manual: https://clunkyard.com/manual#sdk
-import clunkyard
+import clunkyard,std/math
+
+# Bearing is earned: a scan contact's bearing is off by up to its bearingError
+# (degrees, a fixed share of the arc), so a wide beam finds a robot and a narrow
+# one aims at it. Contacts within 120 units are exact.
+const searchArc=40.0   # degrees: sweeps the circle in half a second
+const holdWidth=60.0   # units across at the target: it stays in the beam from tick to tick
+const minArc=6.0       # degrees: the narrowest the beam holds
+const window=12        # ticks of sightings the aim averages
+const sightings=8      # narrow sightings in the window before a shot
+const lookEvery=40     # ticks between looks around the target, for a nearer robot
+const reacquire=10     # ticks to look again where a lost target was
 
 template get(query:untyped;robot:pointer):float64=
   block:
@@ -61,8 +74,45 @@ proc scan(robot:pointer;heading,arc,pitch:float64)=
   check(robot,cyScannerHeading(robot,heading));check(robot,cyScannerArc(robot,arc));check(robot,cyScannerPitch(robot,pitch))
 proc show(robot:pointer;text:string)=check(robot,cyStatusText(robot,text.cstring,text.len.cuint))
 proc show(robot:pointer;text:string;value:float64)=show(robot,text);check(robot,cyStatusValue(robot,value))
+
+# A straight line through the narrowest of the last `window` ticks' sightings:
+# where the robot is now and how fast it moves. Each sighting is off by its
+# bearingError; the line averages that out.
+proc fit(robot:pointer;slot,tick:int;position,velocity:var CyVec3;count:var int):bool=
+  var all:array[32,CySighting]
+  var total:cuint
+  var rate:cint
+  if cyTrackerHistory(robot,cint slot,addr all[0],32,addr total)!=CY_OK:return false
+  check(robot,cyMatchTickRate(robot,addr rate))
+  var best=Inf
+  for s in all[0..<int(total)]:
+    if s.tick>tick-window:best=min(best,s.bearingError)
+  var seen:seq[CySighting]
+  for s in all[0..<int(total)]:
+    if s.tick>tick-window and s.bearingError<=1.5*best:seen.add s
+  if seen.len<2:return false
+  var t0=0.0
+  for s in seen:t0+=float64(s.tick)
+  t0/=float64(seen.len)
+  var spread=0.0
+  for s in seen:spread+=(float64(s.tick)-t0)^2
+  # Least squares on one axis: its fitted position now, and its slope per tick.
+  proc line(seen:seq[CySighting];pick:proc(s:CySighting):float64;t0,spread:float64;tick:int):(float64,float64)=
+    var mean=0.0
+    for s in seen:mean+=pick(s)
+    mean/=float64(seen.len)
+    var along=0.0
+    for s in seen:along+=(float64(s.tick)-t0)*(pick(s)-mean)
+    let slope=along/spread
+    (mean+slope*(float64(tick)-t0),slope)
+  let (px,vx)=line(seen,proc(s:CySighting):float64=s.position.x,t0,spread,tick)
+  let (py,vy)=line(seen,proc(s:CySighting):float64=s.position.y,t0,spread,tick)
+  let (pz,vz)=line(seen,proc(s:CySighting):float64=s.position.z,t0,spread,tick)
+  position=CyVec3(x:px,y:py,z:pz);velocity=CyVec3(x:vx*float64(rate),y:vy*float64(rate),z:vz*float64(rate))
+  count=seen.len
+  true
 var freeFlight=false
-var dodgeTicks,dodges=0
+var dodgeTicks,dodges,slot=0
 proc start(robot:pointer)=
   var gravity:CyVec3
   var is3d:cint
@@ -78,21 +128,46 @@ proc turn(robot:pointer)=
   let pitch=get(cyMePitch,robot)
   var tick:cint
   check(robot,cyClockTick(robot,addr tick));check(robot,cyDriveBrake(robot,0.2))
+  var lastSeen:cint=cint(-1000)
+  if slot!=0 and cyTrackerLastSeen(robot,cint slot,addr lastSeen)!=CY_OK:lastSeen= -1000
   if cySensorsNearest(robot,addr target)==CY_OK:
+    slot=int target.slot
     let throttle=if target.range>350:0.7 elif target.range<200: -0.4 else:0.2
-    drive(robot,throttle,steer(target.bearing,heading),steer(target.elevation,pitch));scan(robot,target.bearing,20,target.elevation)
+    drive(robot,throttle,steer(target.bearing,heading),steer(target.elevation,pitch))
+    # Halve the beam each tick until it is holdWidth across at the target:
+    # narrow enough for a precise bearing, wide enough to keep it in.
+    let hold=max(minArc,2*arctan2(holdWidth/2,target.range)*180/PI)
+    # In a crowd a narrow beam sees one robot. Every lookEvery ticks, widen it for a tick.
+    let arc=if tick mod lookEvery==0:searchArc else:max(hold,min(searchArc,last.arc/2))
+    scan(robot,target.bearing,arc,target.elevation)
     var power:cdouble
     var aim:CySolution
-    # cyGunLead is the intercept if the target holds course.
+    var aimed,ready=true
     check(robot,cyGunPowerForFlightTime(robot,target.range,1,addr power))
-    if cyGunLead(robot,addr target,power,addr aim)!=CY_OK:aim.heading=target.bearing;aim.pitch=target.elevation
+    if target.bearingError>0:
+      # A noisy contact: lead the fitted line, and fire only once it rests on enough sightings.
+      var position,velocity:CyVec3
+      var count:int
+      aimed=fit(robot,int target.slot,int tick,position,velocity,count) and cyGunLeadPoint(robot,addr position,addr velocity,power,addr aim)==CY_OK
+      ready=aimed and count>=sightings
+    else:
+      # An exact contact: cyGunLead is the intercept if the target holds course.
+      aimed=cyGunLead(robot,addr target,power,addr aim)==CY_OK
+    if not aimed:aim.heading=target.bearing;aim.pitch=target.elevation
     check(robot,cyGunAimHeading(robot,aim.heading));check(robot,cyGunAimPitch(robot,aim.pitch))
     var now:CyDirection
     var delta:cdouble
     var canFire:cint
     check(robot,cyGunAimNow(robot,addr now));check(robot,cyAnglesAngleDiff(aim.heading,now.heading,addr delta));check(robot,cyGunCanFire(robot,power,10,addr canFire))
-    if abs(delta)<3 and abs(aim.pitch-now.pitch)<3 and canFire!=0:check(robot,cyGunFire(robot));check(robot,cyGunPower(robot,power))
-    show(robot,"TRACK",target.range)
+    if ready and abs(delta)<3 and abs(aim.pitch-now.pitch)<3 and canFire!=0:check(robot,cyGunFire(robot));check(robot,cyGunPower(robot,power))
+    show(robot,(if ready:"TRACK" else:"NARROW"),target.range)
+  elif slot!=0 and int(tick)-int(lastSeen)<=reacquire:
+    # Lost it: look again where it was last seen, widening the beam, before searching.
+    var where:CyVec3
+    var bearing,elevation:cdouble
+    check(robot,cyTrackerPosition(robot,cint slot,addr where));check(robot,cyAnglesBearingTo(addr position,addr where,addr bearing))
+    if freeFlight:check(robot,cyAnglesElevationTo(addr position,addr where,addr elevation))
+    drive(robot,0.5,steer(bearing,heading),steer(elevation,pitch));scan(robot,bearing,min(searchArc,last.arc*2),elevation);show(robot,"REACQUIRE")
   elif cyTrackerCue(robot,addr cue)==CY_OK:
     var bearing,distance,elevation,arc:cdouble
     check(robot,cyAnglesBearingTo(addr position,addr cue.position,addr bearing));check(robot,cyAnglesDistance(addr position,addr cue.position,addr distance))
@@ -106,7 +181,7 @@ proc turn(robot:pointer)=
     var sweep:cdouble
     check(robot,cyAnglesNormalize(last.heading+36,addr sweep))
     let up=if freeFlight:float64((tick div 10)mod 3-1)*35 else:0.0
-    drive(robot,0.5,0.33,steer(0,pitch));scan(robot,sweep,40,up);show(robot,"SEARCH")
+    drive(robot,0.5,0.33,steer(0,pitch));scan(robot,sweep,searchArc,up);show(robot,"SEARCH")
   # A simple dodge: vary it, or predict the shooter.
   var cues:array[32,CyContact]
   var count:cuint
