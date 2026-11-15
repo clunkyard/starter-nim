@@ -7,7 +7,8 @@
 # clock: tick seconds remaining_ticks
 # arena: size gravity terrain_kind ground_height(x y)
 # me: health position velocity heading pitch roll angular_velocity
-#   attitude grounded altitude applied
+#   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+#   from_mount(heading pitch) mount_toward(point)
 # battery: charge capacity regen sustainable_drive compute
 #   drive_cost(fraction)
 # drive: hover_lift
@@ -29,7 +30,8 @@
 # score: me best armour
 # angles: normalize(degrees) angle_diff(target current)
 #   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-#   distance(a b) clamp(value low high)
+#   distance(a b) to_chassis(heading pitch attitude)
+#   from_chassis(heading pitch attitude) clamp(value low high)
 # raw: number(path) text(path) has(path) flag(path) count(path) line()
 # Controls: drive.set(throttle turn pitch_turn)
 #   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -60,6 +62,7 @@ proc scan(robot:pointer;heading,arc,pitch:float64)=
 proc show(robot:pointer;text:string)=check(robot,cyStatusText(robot,text.cstring,text.len.cuint))
 proc show(robot:pointer;text:string;value:float64)=show(robot,text);check(robot,cyStatusValue(robot,value))
 var freeFlight=false
+var dodgeTicks,dodges=0
 proc start(robot:pointer)=
   var gravity:CyVec3
   var is3d:cint
@@ -80,6 +83,7 @@ proc turn(robot:pointer)=
     drive(robot,throttle,steer(target.bearing,heading),steer(target.elevation,pitch));scan(robot,target.bearing,20,target.elevation)
     var power:cdouble
     var aim:CySolution
+    # cyGunLead is the intercept if the target holds course.
     check(robot,cyGunPowerForFlightTime(robot,target.range,1,addr power))
     if cyGunLead(robot,addr target,power,addr aim)!=CY_OK:aim.heading=target.bearing;aim.pitch=target.elevation
     check(robot,cyGunAimHeading(robot,aim.heading));check(robot,cyGunAimPitch(robot,aim.pitch))
@@ -103,6 +107,23 @@ proc turn(robot:pointer)=
     check(robot,cyAnglesNormalize(last.heading+36,addr sweep))
     let up=if freeFlight:float64((tick div 10)mod 3-1)*35 else:0.0
     drive(robot,0.5,0.33,steer(0,pitch));scan(robot,sweep,40,up);show(robot,"SEARCH")
+  # A simple dodge: vary it, or predict the shooter.
+  var cues:array[32,CyContact]
+  var count:cuint
+  var fired=false
+  if cySensorsCues(robot,addr cues[0],cues.len.cuint,addr count)==CY_OK:
+    for heard in cues[0..<int(count)]:fired=fired or heard.source==CY_SOURCE_MUZZLE
+  if dodgeTicks==0 and fired:
+    inc dodges;dodgeTicks=10
+  if dodgeTicks>0:
+    # Odd dodges go left, even ones right; turn +1 and strafe -1 go left.
+    let left=dodges mod 2==1
+    let side=if left:1.0 else: -1.0
+    var control:cint
+    check(robot,cyMatchControl(robot,addr control));dec dodgeTicks
+    if control==CY_CONTROL_FORCES:check(robot,cyDriveThrottle(robot,0.5));check(robot,cyDriveStrafe(robot,-side))
+    else:check(robot,cyDriveThrottle(robot,1));check(robot,cyDriveTurn(robot,side))
+    show(robot,(if left:"dodge:left" else:"dodge:right"),float64(dodges))
   if get(cyBatteryCharge,robot)<get(cyBatteryCapacity,robot)/4:check(robot,cyDriveThrottle(robot,get(cyDriveGetThrottle,robot)*0.5))
   var storm:CyStorm
   var margin:cdouble
